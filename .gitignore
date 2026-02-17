@@ -6,3 +6,4 @@ dist
 .netlify
 .DS_Store
 prisma/generated
+.env
