@@ -14,7 +14,7 @@ export default function SellerDashboard() {
   const [formError, setFormError] = useState("");
 
   // Form state
-  const [form, setForm] = useState({ name: "", description: "", price: "", stock: "", categoryId: "" });
+  const [form, setForm] = useState({ name: "", description: "", price: "", stock: "", categoryId: "", images: "" });
 
   const fetchData = async () => {
     setLoading(true);
@@ -42,14 +42,19 @@ export default function SellerDashboard() {
     }
     setSaving(true);
     try {
+      const imageList = form.images
+        .split(",")
+        .map((url) => url.trim())
+        .filter(Boolean);
       await productsApi.create({
         name: form.name,
         description: form.description,
         price: parseFloat(form.price),
         stock: parseInt(form.stock || "0"),
         categoryId: form.categoryId,
+        images: imageList,
       } as Partial<Product>);
-      setForm({ name: "", description: "", price: "", stock: "", categoryId: "" });
+      setForm({ name: "", description: "", price: "", stock: "", categoryId: "", images: "" });
       setShowAddForm(false);
       await fetchData();
     } catch {
@@ -179,6 +184,16 @@ export default function SellerDashboard() {
                   onChange={(e) => setForm({ ...form, stock: e.target.value })}
                   className="w-full px-4 py-2.5 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
                   placeholder="0"
+                />
+              </div>
+              <div className="md:col-span-2">
+                <label className="block text-sm font-medium text-gray-700 mb-1">Image URLs (comma-separated)</label>
+                <input
+                  type="text"
+                  value={form.images}
+                  onChange={(e) => setForm({ ...form, images: e.target.value })}
+                  className="w-full px-4 py-2.5 border rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-orange-500"
+                  placeholder="https://example.com/img1.jpg, https://example.com/img2.jpg"
                 />
               </div>
               <div className="md:col-span-2">

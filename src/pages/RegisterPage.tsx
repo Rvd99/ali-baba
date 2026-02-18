@@ -15,12 +15,25 @@ export default function RegisterPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+
+    if (password.length < 6) {
+      setError("Password must be at least 6 characters.");
+      return;
+    }
+
     setLoading(true);
     try {
       await register({ name, email, password, role });
-      navigate("/");
-    } catch {
-      setError("Registration failed. Please try again.");
+      navigate(role === "SELLER" ? "/seller/dashboard" : "/");
+    } catch (err: unknown) {
+      const apiError = (err as { response?: { data?: { error?: string }; status?: number } })?.response;
+      if (apiError?.status === 409) {
+        setError("An account with this email already exists. Please sign in instead.");
+      } else if (apiError?.data?.error) {
+        setError(apiError.data.error);
+      } else {
+        setError("Registration failed. Please check your connection and try again.");
+      }
     } finally {
       setLoading(false);
     }
