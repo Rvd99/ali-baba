@@ -1,84 +1,65 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
-import { getPrisma } from "./lib/prisma";
+import { randomUUID } from "crypto";
+import { supabase } from "./lib/supabase";
 import { getUserFromHeader, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
   if (event.httpMethod === "OPTIONS") return corsPreflightResponse();
 
-  const prisma = getPrisma();
   const params = event.queryStringParameters || {};
 
   try {
     // GET — list products or get single product
     if (event.httpMethod === "GET") {
-      // Single product by id or slug
       if (params.id) {
-        const product = await prisma.product.findUnique({
-          where: { id: params.id },
-          include: { category: true, seller: { select: { id: true, name: true, company: true, avatar: true } }, reviews: { include: { user: { select: { id: true, name: true, avatar: true } } }, orderBy: { createdAt: "desc" } } },
-        });
+        const { data: product } = await supabase
+          .from("Product")
+          .select("*, category:Category(*), seller:User!sellerId(id,name,company,avatar), reviews:Review(*, user:User!userId(id,name,avatar))")
+          .eq("id", params.id)
+          .maybeSingle();
         if (!product) return jsonResponse(404, { error: "Product not found" });
         return jsonResponse(200, product);
       }
 
       if (params.slug) {
-        const product = await prisma.product.findUnique({
-          where: { slug: params.slug },
-          include: { category: true, seller: { select: { id: true, name: true, company: true, avatar: true } }, reviews: { include: { user: { select: { id: true, name: true, avatar: true } } }, orderBy: { createdAt: "desc" } } },
-        });
+        const { data: product } = await supabase
+          .from("Product")
+          .select("*, category:Category(*), seller:User!sellerId(id,name,company,avatar), reviews:Review(*, user:User!userId(id,name,avatar))")
+          .eq("slug", params.slug)
+          .maybeSingle();
         if (!product) return jsonResponse(404, { error: "Product not found" });
         return jsonResponse(200, product);
       }
 
-      // List with filters
       const page = Math.max(1, parseInt(params.page || "1"));
       const limit = Math.min(50, Math.max(1, parseInt(params.limit || "20")));
-      const skip = (page - 1) * limit;
+      const from = (page - 1) * limit;
+      const to = from + limit - 1;
 
-      const where: Record<string, unknown> = { published: true };
+      let query = supabase
+        .from("Product")
+        .select("*, category:Category(*), seller:User!sellerId(id,name,company)", { count: "exact" })
+        .eq("published", true)
+        .range(from, to);
 
-      if (params.search) {
-        where.OR = [
-          { name: { contains: params.search, mode: "insensitive" } },
-          { description: { contains: params.search, mode: "insensitive" } },
-          { tags: { has: params.search.toLowerCase() } },
-        ];
-      }
-      if (params.category) {
-        where.category = { slug: params.category };
-      }
-      if (params.categoryId) {
-        where.categoryId = params.categoryId;
-      }
-      if (params.sellerId) {
-        where.sellerId = params.sellerId;
-      }
-      if (params.minPrice || params.maxPrice) {
-        where.price = {};
-        if (params.minPrice) (where.price as Record<string, number>).gte = parseFloat(params.minPrice);
-        if (params.maxPrice) (where.price as Record<string, number>).lte = parseFloat(params.maxPrice);
-      }
+      if (params.search) query = query.ilike("name", `%${params.search}%`);
+      if (params.categoryId) query = query.eq("categoryId", params.categoryId);
+      if (params.sellerId) query = query.eq("sellerId", params.sellerId);
+      if (params.minPrice) query = query.gte("price", parseFloat(params.minPrice));
+      if (params.maxPrice) query = query.lte("price", parseFloat(params.maxPrice));
 
-      const orderMap: Record<string, Record<string, string>> = {
-        price_asc: { price: "asc" },
-        price_desc: { price: "desc" },
-        newest: { createdAt: "desc" },
-        name: { name: "asc" },
+      const sortMap: Record<string, { column: string; ascending: boolean }> = {
+        price_asc: { column: "price", ascending: true },
+        price_desc: { column: "price", ascending: false },
+        newest: { column: "createdAt", ascending: false },
+        name: { column: "name", ascending: true },
       };
-      const orderBy = orderMap[params.sort || ""] || { createdAt: "desc" };
+      const sort = sortMap[params.sort || ""] || { column: "createdAt", ascending: false };
+      query = query.order(sort.column, { ascending: sort.ascending });
 
-      const [products, total] = await Promise.all([
-        prisma.product.findMany({
-          where,
-          include: { category: true, seller: { select: { id: true, name: true, company: true } } },
-          orderBy,
-          skip,
-          take: limit,
-        }),
-        prisma.product.count({ where }),
-      ]);
-
-      return jsonResponse(200, { products, total, page, limit, totalPages: Math.ceil(total / limit) });
+      const { data: products, count } = await query;
+      const total = count || 0;
+      return jsonResponse(200, { products: products || [], total, page, limit, totalPages: Math.ceil(total / limit) });
     }
 
     // POST — create product (seller only)
@@ -98,11 +79,11 @@ const handler: Handler = async (event: HandlerEvent) => {
 
       const slug = name.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "") + "-" + Date.now().toString(36);
 
-      const product = await prisma.product.create({
-        data: {
-          name,
-          slug,
-          description,
+      const { data: product, error } = await supabase
+        .from("Product")
+        .insert({
+          id: randomUUID(),
+          name, slug, description,
           price: parseFloat(price),
           compareAt: compareAt ? parseFloat(compareAt) : null,
           images: images || [],
@@ -112,10 +93,11 @@ const handler: Handler = async (event: HandlerEvent) => {
           tags: tags || [],
           sellerId: user.userId,
           categoryId,
-        },
-        include: { category: true },
-      });
+        })
+        .select("*, category:Category(*)")
+        .single();
 
+      if (error) return jsonResponse(500, { error: error.message });
       return jsonResponse(201, product);
     }
 
@@ -127,7 +109,7 @@ const handler: Handler = async (event: HandlerEvent) => {
       const id = params.id;
       if (!id) return jsonResponse(400, { error: "Product id is required" });
 
-      const existing = await prisma.product.findUnique({ where: { id } });
+      const { data: existing } = await supabase.from("Product").select("sellerId").eq("id", id).maybeSingle();
       if (!existing) return jsonResponse(404, { error: "Product not found" });
       if (existing.sellerId !== user.userId && user.role !== "ADMIN") {
         return jsonResponse(403, { error: "You can only edit your own products" });
@@ -149,12 +131,14 @@ const handler: Handler = async (event: HandlerEvent) => {
       if (categoryId !== undefined) data.categoryId = categoryId;
       if (published !== undefined) data.published = published;
 
-      const product = await prisma.product.update({
-        where: { id },
-        data,
-        include: { category: true },
-      });
+      const { data: product, error } = await supabase
+        .from("Product")
+        .update(data)
+        .eq("id", id)
+        .select("*, category:Category(*)")
+        .single();
 
+      if (error) return jsonResponse(500, { error: error.message });
       return jsonResponse(200, product);
     }
 
@@ -166,13 +150,13 @@ const handler: Handler = async (event: HandlerEvent) => {
       const id = params.id;
       if (!id) return jsonResponse(400, { error: "Product id is required" });
 
-      const existing = await prisma.product.findUnique({ where: { id } });
+      const { data: existing } = await supabase.from("Product").select("sellerId").eq("id", id).maybeSingle();
       if (!existing) return jsonResponse(404, { error: "Product not found" });
       if (existing.sellerId !== user.userId && user.role !== "ADMIN") {
         return jsonResponse(403, { error: "You can only delete your own products" });
       }
 
-      await prisma.product.delete({ where: { id } });
+      await supabase.from("Product").delete().eq("id", id);
       return jsonResponse(200, { message: "Product deleted" });
     }
 

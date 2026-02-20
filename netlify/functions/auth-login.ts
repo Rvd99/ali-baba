@@ -1,6 +1,6 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
 import bcrypt from "bcryptjs";
-import { getPrisma } from "./lib/prisma";
+import { supabase } from "./lib/supabase";
 import { signToken, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
@@ -14,8 +14,11 @@ const handler: Handler = async (event: HandlerEvent) => {
       return jsonResponse(400, { error: "Email and password are required" });
     }
 
-    const prisma = getPrisma();
-    const user = await prisma.user.findUnique({ where: { email } });
+    const { data: user } = await supabase
+      .from("User")
+      .select("id, email, name, role, avatar, company, password")
+      .eq("email", email)
+      .maybeSingle();
 
     if (!user || !(await bcrypt.compare(password, user.password))) {
       return jsonResponse(401, { error: "Invalid email or password" });

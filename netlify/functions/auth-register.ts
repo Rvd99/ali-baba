@@ -1,6 +1,7 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
 import bcrypt from "bcryptjs";
-import { getPrisma } from "./lib/prisma";
+import { randomUUID } from "crypto";
+import { supabase } from "./lib/supabase";
 import { signToken, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
@@ -14,28 +15,45 @@ const handler: Handler = async (event: HandlerEvent) => {
       return jsonResponse(400, { error: "Email, password, and name are required" });
     }
 
-    const prisma = getPrisma();
+    if (password.length < 6) {
+      return jsonResponse(400, { error: "Password must be at least 6 characters" });
+    }
 
-    const existing = await prisma.user.findUnique({ where: { email } });
+    const { data: existing } = await supabase
+      .from("User")
+      .select("id")
+      .eq("email", email)
+      .maybeSingle();
+
     if (existing) {
       return jsonResponse(409, { error: "An account with this email already exists" });
     }
 
     const hashedPassword = await bcrypt.hash(password, 12);
-
     const validRoles = ["BUYER", "SELLER"];
     const userRole = validRoles.includes(role) ? role : "BUYER";
 
-    const user = await prisma.user.create({
-      data: {
+    const now = new Date().toISOString();
+    const { data: user, error } = await supabase
+      .from("User")
+      .insert({
+        id: randomUUID(),
         email,
         password: hashedPassword,
         name,
         role: userRole,
         phone: phone || null,
         company: company || null,
-      },
-    });
+        createdAt: now,
+        updatedAt: now,
+      })
+      .select()
+      .single();
+
+    if (error || !user) {
+      console.error("Insert error:", error);
+      return jsonResponse(500, { error: "Failed to create account" });
+    }
 
     const token = signToken({ userId: user.id, role: user.role });
 

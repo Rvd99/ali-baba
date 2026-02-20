@@ -1,5 +1,6 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
-import { getPrisma } from "./lib/prisma";
+import { randomUUID } from "crypto";
+import { supabase } from "./lib/supabase";
 import { getUserFromHeader, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
@@ -8,33 +9,34 @@ const handler: Handler = async (event: HandlerEvent) => {
   const user = getUserFromHeader(event.headers.authorization);
   if (!user) return jsonResponse(401, { error: "Authentication required" });
 
-  const prisma = getPrisma();
   const params = event.queryStringParameters || {};
 
   try {
     // GET — get wishlist with product details
     if (event.httpMethod === "GET") {
-      let wishlist = await prisma.wishlist.findUnique({
-        where: { userId: user.userId },
-        include: { items: true },
-      });
+      let { data: wishlist } = await supabase
+        .from("Wishlist")
+        .select("id, items:WishlistItem(id, productId, createdAt)")
+        .eq("userId", user.userId)
+        .maybeSingle();
 
       if (!wishlist) {
-        wishlist = await prisma.wishlist.create({
-          data: { userId: user.userId },
-          include: { items: true },
-        });
+        const { data: newWishlist } = await supabase.from("Wishlist").insert({ id: randomUUID(), userId: user.userId }).select("id").single();
+        wishlist = { id: newWishlist?.id, items: [] };
       }
 
-      // Fetch product details
-      const productIds = wishlist.items.map((i) => i.productId);
-      const products = await prisma.product.findMany({
-        where: { id: { in: productIds } },
-        select: { id: true, name: true, slug: true, price: true, compareAt: true, images: true, stock: true },
-      });
-      const productMap = new Map(products.map((p) => [p.id, p]));
+      const items = (wishlist.items || []) as Array<{ id: string; productId: string; createdAt: string }>;
+      const productIds = items.map((i) => i.productId);
+      let productMap = new Map();
+      if (productIds.length > 0) {
+        const { data: products } = await supabase
+          .from("Product")
+          .select("id, name, slug, price, compareAt, images, stock")
+          .in("id", productIds);
+        productMap = new Map((products || []).map((p: { id: string }) => [p.id, p]));
+      }
 
-      const enrichedItems = wishlist.items.map((item) => ({
+      const enrichedItems = items.map((item) => ({
         id: item.id,
         productId: item.productId,
         createdAt: item.createdAt,
@@ -49,27 +51,25 @@ const handler: Handler = async (event: HandlerEvent) => {
       const { productId } = JSON.parse(event.body || "{}");
       if (!productId) return jsonResponse(400, { error: "productId is required" });
 
-      // Validate product exists
-      const product = await prisma.product.findUnique({ where: { id: productId } });
+      const { data: product } = await supabase.from("Product").select("id").eq("id", productId).maybeSingle();
       if (!product) return jsonResponse(404, { error: "Product not found" });
 
-      let wishlist = await prisma.wishlist.findUnique({ where: { userId: user.userId } });
+      let { data: wishlist } = await supabase.from("Wishlist").select("id").eq("userId", user.userId).maybeSingle();
       if (!wishlist) {
-        wishlist = await prisma.wishlist.create({ data: { userId: user.userId } });
+        const { data: newWishlist } = await supabase.from("Wishlist").insert({ id: randomUUID(), userId: user.userId }).select("id").single();
+        wishlist = newWishlist;
       }
 
-      // Check if already in wishlist
-      const existing = await prisma.wishlistItem.findUnique({
-        where: { wishlistId_productId: { wishlistId: wishlist.id, productId } },
-      });
-      if (existing) {
-        return jsonResponse(200, { message: "Already in wishlist" });
-      }
+      const { data: existing } = await supabase
+        .from("WishlistItem")
+        .select("id")
+        .eq("wishlistId", wishlist!.id)
+        .eq("productId", productId)
+        .maybeSingle();
 
-      await prisma.wishlistItem.create({
-        data: { wishlistId: wishlist.id, productId },
-      });
+      if (existing) return jsonResponse(200, { message: "Already in wishlist" });
 
+      await supabase.from("WishlistItem").insert({ id: randomUUID(), wishlistId: wishlist!.id, productId });
       return jsonResponse(201, { message: "Added to wishlist" });
     }
 
@@ -78,13 +78,10 @@ const handler: Handler = async (event: HandlerEvent) => {
       const productId = params.productId;
       if (!productId) return jsonResponse(400, { error: "productId query param is required" });
 
-      const wishlist = await prisma.wishlist.findUnique({ where: { userId: user.userId } });
+      const { data: wishlist } = await supabase.from("Wishlist").select("id").eq("userId", user.userId).maybeSingle();
       if (!wishlist) return jsonResponse(404, { error: "Wishlist not found" });
 
-      await prisma.wishlistItem.deleteMany({
-        where: { wishlistId: wishlist.id, productId },
-      });
-
+      await supabase.from("WishlistItem").delete().eq("wishlistId", wishlist.id).eq("productId", productId);
       return jsonResponse(200, { message: "Removed from wishlist" });
     }
 

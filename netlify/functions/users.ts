@@ -1,6 +1,7 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
 import bcrypt from "bcryptjs";
-import { getPrisma } from "./lib/prisma";
+import { randomUUID } from "crypto";
+import { supabase } from "./lib/supabase";
 import { getUserFromHeader, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
@@ -9,32 +10,19 @@ const handler: Handler = async (event: HandlerEvent) => {
   const authUser = getUserFromHeader(event.headers.authorization);
   if (!authUser) return jsonResponse(401, { error: "Authentication required" });
 
-  const prisma = getPrisma();
   const params = event.queryStringParameters || {};
 
   try {
-    // GET — get own profile or user by id (public info)
+    // GET — get own profile or user by id
     if (event.httpMethod === "GET") {
       const userId = params.id || authUser.userId;
       const isSelf = userId === authUser.userId;
 
-      const user = await prisma.user.findUnique({
-        where: { id: userId },
-        select: {
-          id: true,
-          email: isSelf,
-          name: true,
-          role: true,
-          phone: isSelf,
-          avatar: true,
-          bio: true,
-          company: true,
-          createdAt: true,
-          addresses: isSelf,
-          _count: { select: { products: true, reviews: true } },
-        },
-      });
+      const selectFields = isSelf
+        ? "id, email, name, role, phone, avatar, bio, company, createdAt, addresses:Address(*)"
+        : "id, name, role, avatar, bio, company, createdAt";
 
+      const { data: user } = await supabase.from("User").select(selectFields).eq("id", userId).maybeSingle();
       if (!user) return jsonResponse(404, { error: "User not found" });
       return jsonResponse(200, user);
     }
@@ -51,37 +39,27 @@ const handler: Handler = async (event: HandlerEvent) => {
       if (bio !== undefined) data.bio = bio || null;
       if (company !== undefined) data.company = company || null;
 
-      // Password change
       if (newPassword) {
-        if (!currentPassword) {
-          return jsonResponse(400, { error: "Current password is required to set a new password" });
-        }
-        const existing = await prisma.user.findUnique({ where: { id: authUser.userId } });
+        if (!currentPassword) return jsonResponse(400, { error: "Current password is required" });
+        const { data: existing } = await supabase.from("User").select("password").eq("id", authUser.userId).single();
         if (!existing || !(await bcrypt.compare(currentPassword, existing.password))) {
           return jsonResponse(401, { error: "Current password is incorrect" });
         }
         data.password = await bcrypt.hash(newPassword, 12);
       }
 
-      const user = await prisma.user.update({
-        where: { id: authUser.userId },
-        data,
-        select: {
-          id: true,
-          email: true,
-          name: true,
-          role: true,
-          phone: true,
-          avatar: true,
-          bio: true,
-          company: true,
-        },
-      });
+      const { data: user, error } = await supabase
+        .from("User")
+        .update(data)
+        .eq("id", authUser.userId)
+        .select("id, email, name, role, phone, avatar, bio, company")
+        .single();
 
+      if (error) return jsonResponse(500, { error: error.message });
       return jsonResponse(200, user);
     }
 
-    // POST — add address
+    // POST — add/delete address
     if (event.httpMethod === "POST") {
       const body = JSON.parse(event.body || "{}");
 
@@ -90,45 +68,27 @@ const handler: Handler = async (event: HandlerEvent) => {
         if (!street || !city || !state || !postalCode || !country) {
           return jsonResponse(400, { error: "street, city, state, postalCode, and country are required" });
         }
-
-        // If this is the default, unset other defaults
         if (isDefault) {
-          await prisma.address.updateMany({
-            where: { userId: authUser.userId },
-            data: { isDefault: false },
-          });
+          await supabase.from("Address").update({ isDefault: false }).eq("userId", authUser.userId);
         }
-
-        const address = await prisma.address.create({
-          data: {
-            userId: authUser.userId,
-            label: label || "Home",
-            street,
-            city,
-            state,
-            postalCode,
-            country,
-            isDefault: isDefault || false,
-          },
-        });
-
+        const { data: address, error } = await supabase
+          .from("Address")
+          .insert({ id: randomUUID(), userId: authUser.userId, label: label || "Home", street, city, state, postalCode, country, isDefault: isDefault || false })
+          .select().single();
+        if (error) return jsonResponse(500, { error: error.message });
         return jsonResponse(201, address);
       }
 
       if (body.action === "delete-address") {
         const { addressId } = body;
         if (!addressId) return jsonResponse(400, { error: "addressId is required" });
-
-        const address = await prisma.address.findUnique({ where: { id: addressId } });
-        if (!address || address.userId !== authUser.userId) {
-          return jsonResponse(404, { error: "Address not found" });
-        }
-
-        await prisma.address.delete({ where: { id: addressId } });
+        const { data: address } = await supabase.from("Address").select("userId").eq("id", addressId).maybeSingle();
+        if (!address || address.userId !== authUser.userId) return jsonResponse(404, { error: "Address not found" });
+        await supabase.from("Address").delete().eq("id", addressId);
         return jsonResponse(200, { message: "Address deleted" });
       }
 
-      return jsonResponse(400, { error: "Unknown action. Use 'add-address' or 'delete-address'." });
+      return jsonResponse(400, { error: "Unknown action." });
     }
 
     return jsonResponse(405, { error: "Method not allowed" });

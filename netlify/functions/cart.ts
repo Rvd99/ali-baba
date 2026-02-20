@@ -1,5 +1,6 @@
 import type { Handler, HandlerEvent } from "@netlify/functions";
-import { getPrisma } from "./lib/prisma";
+import { randomUUID } from "crypto";
+import { supabase } from "./lib/supabase";
 import { getUserFromHeader, jsonResponse, corsPreflightResponse } from "./lib/auth";
 
 const handler: Handler = async (event: HandlerEvent) => {
@@ -8,40 +9,28 @@ const handler: Handler = async (event: HandlerEvent) => {
   const user = getUserFromHeader(event.headers.authorization);
   if (!user) return jsonResponse(401, { error: "Authentication required" });
 
-  const prisma = getPrisma();
-
   try {
     // GET — get current user's cart
     if (event.httpMethod === "GET") {
-      let cart = await prisma.cart.findUnique({
-        where: { userId: user.userId },
-        include: {
-          items: {
-            include: {
-              cart: false,
-              // We can't include product directly on CartItem since there's no relation,
-              // so we'll do a manual lookup below
-            },
-          },
-        },
-      });
+      let { data: cart } = await supabase.from("Cart").select("id, items:CartItem(*)").eq("userId", user.userId).maybeSingle();
 
       if (!cart) {
-        cart = await prisma.cart.create({
-          data: { userId: user.userId },
-          include: { items: true },
-        });
+        const { data: newCart } = await supabase.from("Cart").insert({ id: randomUUID(), userId: user.userId }).select("id").single();
+        cart = { id: newCart?.id, items: [] };
       }
 
-      // Fetch product details for each cart item
-      const productIds = cart.items.map((i) => i.productId);
-      const products = await prisma.product.findMany({
-        where: { id: { in: productIds } },
-        select: { id: true, name: true, slug: true, price: true, images: true, stock: true },
-      });
-      const productMap = new Map(products.map((p) => [p.id, p]));
+      const items = (cart.items || []) as Array<{ id: string; productId: string; quantity: number }>;
+      const productIds = items.map((i) => i.productId);
+      let productMap = new Map();
+      if (productIds.length > 0) {
+        const { data: products } = await supabase
+          .from("Product")
+          .select("id, name, slug, price, images, stock")
+          .in("id", productIds);
+        productMap = new Map((products || []).map((p: { id: string }) => [p.id, p]));
+      }
 
-      const enrichedItems = cart.items.map((item) => ({
+      const enrichedItems = items.map((item) => ({
         id: item.id,
         productId: item.productId,
         quantity: item.quantity,
@@ -54,41 +43,31 @@ const handler: Handler = async (event: HandlerEvent) => {
     // POST — add item to cart
     if (event.httpMethod === "POST") {
       const { productId, quantity } = JSON.parse(event.body || "{}");
-
       if (!productId) return jsonResponse(400, { error: "productId is required" });
       const qty = Math.max(1, parseInt(quantity || "1"));
 
-      // Validate product exists and has stock
-      const product = await prisma.product.findUnique({ where: { id: productId } });
+      const { data: product } = await supabase.from("Product").select("id, stock").eq("id", productId).maybeSingle();
       if (!product) return jsonResponse(404, { error: "Product not found" });
-      if (product.stock < qty) {
-        return jsonResponse(400, { error: `Insufficient stock. Available: ${product.stock}` });
-      }
+      if (product.stock < qty) return jsonResponse(400, { error: `Insufficient stock. Available: ${product.stock}` });
 
-      // Upsert cart
-      let cart = await prisma.cart.findUnique({ where: { userId: user.userId } });
+      let { data: cart } = await supabase.from("Cart").select("id").eq("userId", user.userId).maybeSingle();
       if (!cart) {
-        cart = await prisma.cart.create({ data: { userId: user.userId } });
+        const { data: newCart } = await supabase.from("Cart").insert({ id: randomUUID(), userId: user.userId }).select("id").single();
+        cart = newCart;
       }
 
-      // Upsert cart item
-      const existingItem = await prisma.cartItem.findUnique({
-        where: { cartId_productId: { cartId: cart.id, productId } },
-      });
+      const { data: existingItem } = await supabase
+        .from("CartItem")
+        .select("id, quantity")
+        .eq("cartId", cart!.id)
+        .eq("productId", productId)
+        .maybeSingle();
 
       if (existingItem) {
-        await prisma.cartItem.update({
-          where: { id: existingItem.id },
-          data: { quantity: existingItem.quantity + qty },
-        });
+        await supabase.from("CartItem").update({ quantity: existingItem.quantity + qty }).eq("id", existingItem.id);
       } else {
-        await prisma.cartItem.create({
-          data: { cartId: cart.id, productId, quantity: qty },
-        });
+        await supabase.from("CartItem").insert({ id: randomUUID(), cartId: cart!.id, productId, quantity: qty });
       }
-
-      // Touch the cart updatedAt
-      await prisma.cart.update({ where: { id: cart.id }, data: {} });
 
       return jsonResponse(200, { message: "Item added to cart" });
     }
@@ -98,38 +77,34 @@ const handler: Handler = async (event: HandlerEvent) => {
       const { productId, quantity } = JSON.parse(event.body || "{}");
       if (!productId) return jsonResponse(400, { error: "productId is required" });
 
-      const cart = await prisma.cart.findUnique({ where: { userId: user.userId } });
+      const { data: cart } = await supabase.from("Cart").select("id").eq("userId", user.userId).maybeSingle();
       if (!cart) return jsonResponse(404, { error: "Cart not found" });
 
       const qty = parseInt(quantity || "0");
       if (qty <= 0) {
-        // Remove item
-        await prisma.cartItem.deleteMany({ where: { cartId: cart.id, productId } });
+        await supabase.from("CartItem").delete().eq("cartId", cart.id).eq("productId", productId);
       } else {
-        await prisma.cartItem.upsert({
-          where: { cartId_productId: { cartId: cart.id, productId } },
-          update: { quantity: qty },
-          create: { cartId: cart.id, productId, quantity: qty },
-        });
+        const { data: existing } = await supabase.from("CartItem").select("id").eq("cartId", cart.id).eq("productId", productId).maybeSingle();
+        if (existing) {
+          await supabase.from("CartItem").update({ quantity: qty }).eq("id", existing.id);
+        } else {
+          await supabase.from("CartItem").insert({ id: randomUUID(), cartId: cart.id, productId, quantity: qty });
+        }
       }
-
-      await prisma.cart.update({ where: { id: cart.id }, data: {} });
       return jsonResponse(200, { message: "Cart updated" });
     }
 
     // DELETE — remove item or clear cart
     if (event.httpMethod === "DELETE") {
       const params = event.queryStringParameters || {};
-      const cart = await prisma.cart.findUnique({ where: { userId: user.userId } });
+      const { data: cart } = await supabase.from("Cart").select("id").eq("userId", user.userId).maybeSingle();
       if (!cart) return jsonResponse(404, { error: "Cart not found" });
 
       if (params.productId) {
-        await prisma.cartItem.deleteMany({ where: { cartId: cart.id, productId: params.productId } });
+        await supabase.from("CartItem").delete().eq("cartId", cart.id).eq("productId", params.productId);
         return jsonResponse(200, { message: "Item removed from cart" });
       }
-
-      // Clear entire cart
-      await prisma.cartItem.deleteMany({ where: { cartId: cart.id } });
+      await supabase.from("CartItem").delete().eq("cartId", cart.id);
       return jsonResponse(200, { message: "Cart cleared" });
     }
 
