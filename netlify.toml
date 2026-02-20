@@ -12,7 +12,7 @@
   targetPort = 5173
 
 [functions]
-  node_bundler = "esbuild"
+  node_bundler = "nft"
 
 # API routes → Netlify Functions
 [[redirects]]
